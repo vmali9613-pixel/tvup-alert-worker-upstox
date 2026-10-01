@@ -1,6 +1,5 @@
 /**
- * TVUP Alert Worker — Upstox edition
- * Deploy as a new Render Web Service from this repo.
+ * TVUP Alert Worker — Upstox edition v3.0.1
  * Env: UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
  *      FIREBASE_PROJECT_ID, FIREBASE_API_KEY
  */
@@ -16,21 +15,54 @@ const FB_PROJECT = String(process.env.FIREBASE_PROJECT_ID || process.env.FB_PROJ
 const FB_KEY = String(process.env.FIREBASE_API_KEY || process.env.FB_API_KEY || "").trim();
 
 const LAST_SENT = new Map();
+let symbolKeyCache = null;
 
 const INDEX_UPSTOX = {
   NIFTY: "NSE_INDEX|Nifty 50",
+  NIFTY50: "NSE_INDEX|Nifty 50",
   BANKNIFTY: "NSE_INDEX|Nifty Bank",
+  NIFTYBANK: "NSE_INDEX|Nifty Bank",
   FINNIFTY: "NSE_INDEX|Nifty Fin Service",
   NIFTY500: "NSE_INDEX|Nifty 500",
   CNX500: "NSE_INDEX|Nifty 500",
-  SENSEX: "BSE_INDEX|SENSEX"
+  SENSEX: "BSE_INDEX|SENSEX",
+  BANKEX: "BSE_INDEX|BANKEX"
 };
 
-function toKey(sym) {
+async function loadSymbolKeyMap() {
+  if (symbolKeyCache) return symbolKeyCache;
+  const map = new Map(Object.entries(INDEX_UPSTOX));
+  try {
+    const url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz";
+    const res = await fetch(url);
+    if (res.ok) {
+      const buf = Buffer.from(await res.arrayBuffer());
+      const zlib = require("zlib");
+      const text = zlib.gunzipSync(buf).toString("utf8");
+      const parsed = JSON.parse(text);
+      const list = Array.isArray(parsed) ? parsed : (parsed.data || []);
+      for (const x of list) {
+        const sym = String(x.trading_symbol || "").toUpperCase();
+        const ik = String(x.instrument_key || "").trim();
+        if (sym && ik && !map.has(sym)) map.set(sym, ik);
+      }
+      console.log("[Upstox] Symbol master loaded:", map.size);
+    }
+  } catch (e) {
+    console.warn("[Upstox] master load failed", e.message);
+  }
+  symbolKeyCache = map;
+  return map;
+}
+
+async function toKey(sym) {
   const s = String(sym || "").toUpperCase().trim();
   if (!s) return "";
-  if (s.includes("|")) return s;
+  if (s.includes("|") && /INE[A-Z0-9]+|_INDEX\|/i.test(s)) return s;
   if (INDEX_UPSTOX[s]) return INDEX_UPSTOX[s];
+  const map = await loadSymbolKeyMap();
+  if (map.has(s)) return map.get(s);
+  if (s.includes("|")) return s;
   return "NSE_EQ|" + s;
 }
 
@@ -45,10 +77,17 @@ async function fetchQuotes(keys) {
       headers: { Accept: "application/json", Authorization: "Bearer " + UPSTOX_TOKEN }
     });
     const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.warn("[Upstox] quote HTTP", res.status, body?.message || body?.errors || "");
+      continue;
+    }
     const data = body?.data || {};
     for (const [k, row] of Object.entries(data)) {
       const last = Number(row?.last_price);
-      if (Number.isFinite(last)) out[String(k).toUpperCase()] = last;
+      if (Number.isFinite(last)) {
+        out[String(k).toUpperCase()] = last;
+        out[String(k).replace(":", "|").toUpperCase()] = last;
+      }
     }
   }
   return out;
@@ -72,7 +111,10 @@ function hit(prev, last, target, cond) {
 }
 
 async function loadAlerts() {
-  if (!FB_PROJECT || !FB_KEY) return {};
+  if (!FB_PROJECT || !FB_KEY) {
+    console.warn("[Firestore] Missing FIREBASE_PROJECT_ID or FIREBASE_API_KEY");
+    return {};
+  }
   try {
     const url = `https://firestore.googleapis.com/v1/projects/${FB_PROJECT}/databases/(default)/documents/tvup/alerts?key=${encodeURIComponent(FB_KEY)}`;
     const res = await fetch(url);
@@ -89,6 +131,7 @@ async function loadAlerts() {
 
 async function tick() {
   console.log("---", new Date().toLocaleTimeString(), "Checking Firestore alerts ---");
+  if (!UPSTOX_TOKEN) console.warn("[Upstox] UPSTOX_ACCESS_TOKEN not set");
   const alerts = await loadAlerts();
   const active = Object.entries(alerts).filter(([, r]) => {
     if (!r) return false;
@@ -102,7 +145,7 @@ async function tick() {
   const keyMap = {};
   for (const [, r] of active) {
     const sym = String(r.symbol || "").toUpperCase();
-    keyMap[sym] = r.instrumentKey || r.instrument_key || toKey(sym);
+    keyMap[sym] = r.instrumentKey || r.instrument_key || (await toKey(sym));
   }
   const quotes = await fetchQuotes([...new Set(Object.values(keyMap))]);
   for (const [id, r] of active) {
@@ -112,16 +155,16 @@ async function tick() {
     const target = Number(r.price);
     const prev = LAST_SENT.has(id) ? LAST_SENT.get(id).ltp : NaN;
     const isHit = hit(prev, last, target, r.condition);
-    console.log("[Check]", sym, "ltp=", last, "target=", target, "hit=", isHit);
-    if (Number.isFinite(last)) LAST_SENT.set(id, { ltp: last });
+    console.log("[Check]", sym, "key=", key, "ltp=", last, "target=", target, "hit=", isHit);
+    if (Number.isFinite(last)) LAST_SENT.set(id, { ltp: last, sent: LAST_SENT.get(id)?.sent });
     if (!isHit) continue;
     if (LAST_SENT.get(id)?.sent) continue;
     const msg =
-      "🎯 Price Alert Hit!\n\n" +
-      "📈 Symbol: " + sym + "\n" +
-      "💰 Price: ₹" + last + "\n" +
-      "🎯 Target: ₹" + target + "\n" +
-      "⚙️ Condition: " + String(r.condition || "crossing").replace(/_/g, " ");
+      "\ud83c\udfaf Price Alert Hit!\n\n" +
+      "\ud83d\udcc8 Symbol: " + sym + "\n" +
+      "\ud83d\udcb0 Price: \u20b9" + last + "\n" +
+      "\ud83c\udfaf Target: \u20b9" + target + "\n" +
+      "\u2699\ufe0f Condition: " + String(r.condition || "crossing").replace(/_/g, " ");
     await sendTelegram(msg);
     LAST_SENT.set(id, { ltp: last, sent: true });
     console.log("[TRIGGER]", sym, "[Telegram] sent");
@@ -129,11 +172,12 @@ async function tick() {
 }
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "TVUP Alert Worker (Upstox)", intervalMs: INTERVAL_MS });
+  res.json({ ok: true, service: "TVUP Alert Worker (Upstox)", version: "3.0.1", intervalMs: INTERVAL_MS });
 });
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log("TVUP Alert Worker (Upstox) is running!");
+  console.log("TVUP Alert Worker (Upstox) v3.0.1 is running!");
+  loadSymbolKeyMap().catch(() => {});
   setInterval(() => tick().catch((e) => console.warn(e)), INTERVAL_MS);
   tick().catch(() => {});
 });
