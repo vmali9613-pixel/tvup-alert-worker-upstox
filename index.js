@@ -1,5 +1,5 @@
 /**
- * TVUP Alert Worker — Upstox edition v3.0.1
+ * TVUP Alert Worker — Upstox edition v3.0.6
  * Env: UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
  *      FIREBASE_PROJECT_ID, FIREBASE_API_KEY
  */
@@ -8,7 +8,7 @@ const app = express();
 app.use(express.json());
 
 const INTERVAL_MS = Number(process.env.INTERVAL_MS || 60000);
-const UPSTOX_TOKEN = String(process.env.UPSTOX_ACCESS_TOKEN || process.env.UPSTOX_API_KEY || "").trim();
+let UPSTOX_TOKEN = String(process.env.UPSTOX_ACCESS_TOKEN || process.env.UPSTOX_API_KEY || "").trim();
 const TG_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const TG_CHAT = String(process.env.TELEGRAM_CHAT_ID || "").trim();
 const FB_PROJECT = String(process.env.FIREBASE_PROJECT_ID || process.env.FB_PROJECT || "").trim();
@@ -18,15 +18,19 @@ const LAST_SENT = new Map();
 let symbolKeyCache = null;
 
 const INDEX_UPSTOX = {
-  NIFTY: "NSE_INDEX|Nifty 50",
-  NIFTY50: "NSE_INDEX|Nifty 50",
-  BANKNIFTY: "NSE_INDEX|Nifty Bank",
-  NIFTYBANK: "NSE_INDEX|Nifty Bank",
-  FINNIFTY: "NSE_INDEX|Nifty Fin Service",
-  NIFTY500: "NSE_INDEX|Nifty 500",
-  CNX500: "NSE_INDEX|Nifty 500",
-  SENSEX: "BSE_INDEX|SENSEX",
-  BANKEX: "BSE_INDEX|BANKEX"
+  NIFTY: "NSE_INDEX|Nifty 50", NIFTY50: "NSE_INDEX|Nifty 50",
+  BANKNIFTY: "NSE_INDEX|Nifty Bank", NIFTYBANK: "NSE_INDEX|Nifty Bank",
+  FINNIFTY: "NSE_INDEX|Nifty Fin Service", CNXFINANCE: "NSE_INDEX|Nifty Fin Service",
+  NIFTY500: "NSE_INDEX|Nifty 500", CNX500: "NSE_INDEX|Nifty 500",
+  NIFTY100: "NSE_INDEX|Nifty 100", CNX100: "NSE_INDEX|Nifty 100",
+  NIFTY200: "NSE_INDEX|Nifty 200", CNX200: "NSE_INDEX|Nifty 200",
+  CNXMIDCAP: "NSE_INDEX|Nifty Midcap 100", CNXSMALLCAP: "NSE_INDEX|Nifty Smallcap 100",
+  CNXIT: "NSE_INDEX|Nifty IT", CNXAUTO: "NSE_INDEX|Nifty Auto",
+  CNXFMCG: "NSE_INDEX|Nifty FMCG", CNXPHARMA: "NSE_INDEX|Nifty Pharma",
+  CNXMETAL: "NSE_INDEX|Nifty Metal", CNXREALTY: "NSE_INDEX|Nifty Realty",
+  CNXENERGY: "NSE_INDEX|Nifty Energy", CNXINFRA: "NSE_INDEX|Nifty Infra",
+  INDIAVIX: "NSE_INDEX|India VIX",
+  SENSEX: "BSE_INDEX|SENSEX", BANKEX: "BSE_INDEX|BANKEX"
 };
 
 async function loadSymbolKeyMap() {
@@ -66,40 +70,87 @@ async function toKey(sym) {
   return "NSE_EQ|" + s;
 }
 
-async function fetchQuotes(keys) {
+function indexQuote(quotes, key) {
+  if (!key) return undefined;
+  const k = String(key).toUpperCase();
+  if (Number.isFinite(quotes[k])) return quotes[k];
+  const pipe = k.replace(/:/g, "|");
+  const colon = k.replace(/\|/g, ":");
+  if (Number.isFinite(quotes[pipe])) return quotes[pipe];
+  if (Number.isFinite(quotes[colon])) return quotes[colon];
+  const isin = (pipe.split("|")[1] || colon.split(":")[1] || "").toUpperCase();
+  if (isin && Number.isFinite(quotes[isin])) return quotes[isin];
+  if (isin && Number.isFinite(quotes["NSE_EQ|" + isin])) return quotes["NSE_EQ|" + isin];
+  if (isin && Number.isFinite(quotes["NSE_EQ:" + isin])) return quotes["NSE_EQ:" + isin];
+  return undefined;
+}
+
+async function fetchQuotes(keys, token) {
   const out = {};
-  if (!UPSTOX_TOKEN || !keys.length) return out;
+  const tok = token || UPSTOX_TOKEN;
+  if (!tok || !keys.length) {
+    console.warn("[Upstox] No token or no keys for quote fetch");
+    return out;
+  }
   for (let i = 0; i < keys.length; i += 50) {
     const chunk = keys.slice(i, i + 50);
     const q = chunk.map(encodeURIComponent).join(",");
     const url = "https://api.upstox.com/v2/market-quote/quotes?instrument_key=" + q;
-    const res = await fetch(url, {
-      headers: { Accept: "application/json", Authorization: "Bearer " + UPSTOX_TOKEN }
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      console.warn("[Upstox] quote HTTP", res.status, body?.message || body?.errors || "");
-      continue;
-    }
-    const data = body?.data || {};
-    for (const [k, row] of Object.entries(data)) {
-      const last = Number(row?.last_price);
-      if (Number.isFinite(last)) {
-        out[String(k).toUpperCase()] = last;
-        out[String(k).replace(":", "|").toUpperCase()] = last;
+    try {
+      const res = await fetch(url, {
+        headers: { Accept: "application/json", Authorization: "Bearer " + tok }
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        console.warn("[Upstox] quote HTTP", res.status, JSON.stringify(body).slice(0, 200));
+        if (res.status === 401) console.warn("[Upstox] TOKEN INVALID — set UPSTOX_ACCESS_TOKEN on Render");
+        continue;
       }
+      const data = body?.data || {};
+      let n = 0;
+      for (const [k, row] of Object.entries(data)) {
+        const last = Number(row?.last_price);
+        if (!Number.isFinite(last)) continue;
+        n++;
+        const ku = String(k).toUpperCase();
+        out[ku] = last;
+        out[ku.replace(/:/g, "|")] = last;
+        out[ku.replace(/\|/g, ":")] = last;
+        const ik = String(row.instrument_token || row.instrument_key || "").toUpperCase();
+        if (ik) {
+          out[ik] = last;
+          out[ik.replace(/:/g, "|")] = last;
+          out[ik.replace(/\|/g, ":")] = last;
+        }
+        const tsym = String(row.symbol || row.trading_symbol || "").toUpperCase();
+        if (tsym) out[tsym] = last;
+        const isin = (ku.split(":")[1] || ku.split("|")[1] || "").toUpperCase();
+        if (isin) out[isin] = last;
+      }
+      console.log("[Upstox] quote batch ok, instruments:", n);
+    } catch (e) {
+      console.warn("[Upstox] quote fetch error", e.message);
     }
   }
   return out;
 }
 
 async function sendTelegram(text) {
-  if (!TG_TOKEN || !TG_CHAT) return;
-  await fetch("https://api.telegram.org/bot" + encodeURIComponent(TG_TOKEN) + "/sendMessage", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TG_CHAT, text })
-  });
+  if (!TG_TOKEN || !TG_CHAT) {
+    console.warn("[Telegram] missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID");
+    return;
+  }
+  try {
+    const res = await fetch("https://api.telegram.org/bot" + encodeURIComponent(TG_TOKEN) + "/sendMessage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: TG_CHAT, text })
+    });
+    if (!res.ok) console.warn("[Telegram] send failed", res.status, await res.text().catch(() => ""));
+    else console.log("[Telegram] sent");
+  } catch (e) {
+    console.warn("[Telegram] error", e.message);
+  }
 }
 
 function hit(prev, last, target, cond) {
@@ -110,53 +161,78 @@ function hit(prev, last, target, cond) {
   return (Number.isFinite(prev) && ((prev < target && last >= target) || (prev > target && last <= target))) || last === target;
 }
 
-async function loadAlerts() {
-  if (!FB_PROJECT || !FB_KEY) {
-    console.warn("[Firestore] Missing FIREBASE_PROJECT_ID or FIREBASE_API_KEY");
-    return {};
+async function loadAlertsDoc() {
+  if (!FB_PROJECT) {
+    console.warn("[Firestore] Missing FIREBASE_PROJECT_ID");
+    return { alerts: {}, tokenFromDoc: "" };
   }
   try {
-    const url = `https://firestore.googleapis.com/v1/projects/${FB_PROJECT}/databases/(default)/documents/tvup/alerts?key=${encodeURIComponent(FB_KEY)}`;
+    let url = `https://firestore.googleapis.com/v1/projects/${FB_PROJECT}/databases/(default)/documents/tvup/alerts`;
+    if (FB_KEY && FB_KEY !== "direct") url += `?key=${encodeURIComponent(FB_KEY)}`;
     const res = await fetch(url);
     const body = await res.json();
-    const raw = body?.fields?.alertsJson?.stringValue;
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
+    if (!res.ok) {
+      console.warn("[Firestore] HTTP", res.status, JSON.stringify(body).slice(0, 150));
+      return { alerts: {}, tokenFromDoc: "" };
+    }
+    const fields = body?.fields || {};
+    const raw = fields.alertsJson?.stringValue;
+    let alerts = {};
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") alerts = parsed;
+      } catch (_) {}
+    }
+    const tokenFromDoc = String(fields.upstoxToken?.stringValue || "").trim();
+    return { alerts, tokenFromDoc };
   } catch (e) {
     console.warn("[Firestore] load failed", e.message);
-    return {};
+    return { alerts: {}, tokenFromDoc: "" };
   }
 }
 
 async function tick() {
   console.log("---", new Date().toLocaleTimeString(), "Checking Firestore alerts ---");
-  if (!UPSTOX_TOKEN) console.warn("[Upstox] UPSTOX_ACCESS_TOKEN not set");
-  const alerts = await loadAlerts();
+  const { alerts, tokenFromDoc } = await loadAlertsDoc();
+  if (tokenFromDoc && tokenFromDoc.length > 20) {
+    UPSTOX_TOKEN = tokenFromDoc;
+  }
+  if (!UPSTOX_TOKEN) {
+    console.warn("[Upstox] No access token (env UPSTOX_ACCESS_TOKEN or Firestore upstoxToken)");
+  }
+
   const active = Object.entries(alerts).filter(([, r]) => {
     if (!r) return false;
     const st = String(r.status || "active").toLowerCase();
-    if (st === "paused" || st === "triggered") return false;
+    if (st === "paused" || st === "triggered" || st === "stopped") return false;
     if (r.armed === false) return false;
     return true;
   });
   console.log("[Firestore] Total active alert(s):", active.length, active.map(([id]) => id));
   if (!active.length) return;
+
   const keyMap = {};
   for (const [, r] of active) {
     const sym = String(r.symbol || "").toUpperCase();
     keyMap[sym] = r.instrumentKey || r.instrument_key || (await toKey(sym));
   }
-  const quotes = await fetchQuotes([...new Set(Object.values(keyMap))]);
+  const keys = [...new Set(Object.values(keyMap).filter(Boolean))];
+  const quotes = await fetchQuotes(keys, UPSTOX_TOKEN);
+
   for (const [id, r] of active) {
     const sym = String(r.symbol || "").toUpperCase();
-    const key = String(keyMap[sym] || "").toUpperCase();
-    const last = quotes[key] || quotes[key.replace("|", ":")] || quotes[sym];
+    const key = String(keyMap[sym] || "");
+    let last = indexQuote(quotes, key);
+    if (!Number.isFinite(last)) last = indexQuote(quotes, sym);
     const target = Number(r.price);
     const prev = LAST_SENT.has(id) ? LAST_SENT.get(id).ltp : NaN;
     const isHit = hit(prev, last, target, r.condition);
     console.log("[Check]", sym, "key=", key, "ltp=", last, "target=", target, "hit=", isHit);
-    if (Number.isFinite(last)) LAST_SENT.set(id, { ltp: last, sent: LAST_SENT.get(id)?.sent });
+    if (Number.isFinite(last)) {
+      const prevSent = LAST_SENT.get(id)?.sent;
+      LAST_SENT.set(id, { ltp: last, sent: prevSent });
+    }
     if (!isHit) continue;
     if (LAST_SENT.get(id)?.sent) continue;
     const msg =
@@ -172,11 +248,19 @@ async function tick() {
 }
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "TVUP Alert Worker (Upstox)", version: "3.0.1", intervalMs: INTERVAL_MS });
+  res.json({
+    ok: true,
+    service: "TVUP Alert Worker (Upstox)",
+    version: "3.0.6",
+    intervalMs: INTERVAL_MS,
+    hasToken: Boolean(UPSTOX_TOKEN),
+    hasTelegram: Boolean(TG_TOKEN && TG_CHAT),
+    firebaseProject: FB_PROJECT || null
+  });
 });
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log("TVUP Alert Worker (Upstox) v3.0.1 is running!");
+  console.log("TVUP Alert Worker (Upstox) v3.0.6 is running!");
   loadSymbolKeyMap().catch(() => {});
   setInterval(() => tick().catch((e) => console.warn(e)), INTERVAL_MS);
   tick().catch(() => {});
