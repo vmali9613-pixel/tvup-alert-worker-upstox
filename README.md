@@ -1,25 +1,20 @@
-# TVUP Alert Worker (Upstox)
+# TVUP Alert Worker (Upstox) v3.0.1
 
-Cloud worker for **TVUP Watchlist for Upstox**.
-Do not connect this repo to the old Fyers Render service.
-
-Repo: https://github.com/vmali9613-pixel/tvup-alert-worker-upstox
+https://github.com/vmali9613-pixel/tvup-alert-worker-upstox
 
 ## Render
-- Runtime: Node
 - Build: `npm install`
 - Start: `node index.js`
 
-## Environment variables
-- `UPSTOX_ACCESS_TOKEN`
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-- `FIREBASE_PROJECT_ID`
-- `FIREBASE_API_KEY`
-- `INTERVAL_MS` (optional, default 60000)
+## Env
+- UPSTOX_ACCESS_TOKEN
+- TELEGRAM_BOT_TOKEN
+- TELEGRAM_CHAT_ID
+- FIREBASE_PROJECT_ID
+- FIREBASE_API_KEY
+- INTERVAL_MS (optional)
 
 ## Health
-`GET /` → `{ ok: true, service: "TVUP Alert Worker (Upstox)" }`
+GET / → ok + version 3.0.1
 
-## Firestore
-Document: `tvup/alerts` field `alertsJson` (stringified object).
+Loads Upstox NSE symbol master so alert symbols resolve to real instrument keys (ISIN).
