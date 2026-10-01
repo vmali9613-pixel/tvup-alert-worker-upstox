@@ -1,5 +1,5 @@
 /**
- * TVUP Alert Worker — Upstox edition v3.0.6
+ * TVUP Alert Worker — Upstox edition v3.0.7
  * Env: UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
  *      FIREBASE_PROJECT_ID, FIREBASE_API_KEY
  */
@@ -153,12 +153,26 @@ async function sendTelegram(text) {
   }
 }
 
+/** Float-safe alert hit. Crossing treats near-equal LTP as hit (tick noise). */
 function hit(prev, last, target, cond) {
   const c = String(cond || "crossing").toLowerCase();
   if (!Number.isFinite(last) || !Number.isFinite(target)) return false;
-  if (c.includes("above") || c === ">") return last >= target && !(Number.isFinite(prev) && prev >= target);
-  if (c.includes("below") || c === "<") return last <= target && !(Number.isFinite(prev) && prev <= target);
-  return (Number.isFinite(prev) && ((prev < target && last >= target) || (prev > target && last <= target))) || last === target;
+  const eps = Math.max(0.05, Math.abs(target) * 0.00005);
+  const near = Math.abs(last - target) <= eps;
+
+  if (c.includes("above") || c === ">") {
+    const now = last >= target - eps;
+    const was = Number.isFinite(prev) && prev >= target - eps;
+    return now && !was;
+  }
+  if (c.includes("below") || c === "<") {
+    const now = last <= target + eps;
+    const was = Number.isFinite(prev) && prev <= target + eps;
+    return now && !was;
+  }
+  if (near) return true;
+  if (!Number.isFinite(prev)) return false;
+  return (prev < target - eps && last >= target - eps) || (prev > target + eps && last <= target + eps);
 }
 
 async function loadAlertsDoc() {
@@ -189,6 +203,32 @@ async function loadAlertsDoc() {
   } catch (e) {
     console.warn("[Firestore] load failed", e.message);
     return { alerts: {}, tokenFromDoc: "" };
+  }
+}
+
+async function markTriggeredInFirestore(alertId) {
+  if (!FB_PROJECT || !alertId) return;
+  try {
+    const { alerts } = await loadAlertsDoc();
+    if (!alerts[alertId]) return;
+    alerts[alertId].status = "triggered";
+    alerts[alertId].armed = false;
+    alerts[alertId].lastTriggeredAt = Date.now();
+    let url = `https://firestore.googleapis.com/v1/projects/${FB_PROJECT}/databases/(default)/documents/tvup/alerts?updateMask.fieldPaths=alertsJson&updateMask.fieldPaths=updatedAt`;
+    if (FB_KEY && FB_KEY !== "direct") url += `&key=${encodeURIComponent(FB_KEY)}`;
+    await fetch(url, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fields: {
+          alertsJson: { stringValue: JSON.stringify(alerts) },
+          updatedAt: { integerValue: String(Date.now()) }
+        }
+      })
+    });
+    console.log("[Firestore] marked triggered:", alertId);
+  } catch (e) {
+    console.warn("[Firestore] mark triggered failed", e.message);
   }
 }
 
@@ -244,6 +284,7 @@ async function tick() {
     await sendTelegram(msg);
     LAST_SENT.set(id, { ltp: last, sent: true });
     console.log("[TRIGGER]", sym, "[Telegram] sent");
+    await markTriggeredInFirestore(id);
   }
 }
 
@@ -251,7 +292,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "TVUP Alert Worker (Upstox)",
-    version: "3.0.6",
+    version: "3.0.7",
     intervalMs: INTERVAL_MS,
     hasToken: Boolean(UPSTOX_TOKEN),
     hasTelegram: Boolean(TG_TOKEN && TG_CHAT),
@@ -260,7 +301,7 @@ app.get("/", (_req, res) => {
 });
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log("TVUP Alert Worker (Upstox) v3.0.6 is running!");
+  console.log("TVUP Alert Worker (Upstox) v3.0.7 is running!");
   loadSymbolKeyMap().catch(() => {});
   setInterval(() => tick().catch((e) => console.warn(e)), INTERVAL_MS);
   tick().catch(() => {});
