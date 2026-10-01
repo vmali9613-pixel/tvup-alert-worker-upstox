@@ -1,20 +1,20 @@
 /**
- * TVUP Alert Worker — Upstox edition v3.0.8
+ * TVUP Alert Worker — Upstox v3.0.9 (reliable same-LTP + batch trigger)
  * Env: UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
- *      FIREBASE_PROJECT_ID, FIREBASE_API_KEY
+ *      FIREBASE_PROJECT_ID, FIREBASE_API_KEY, INTERVAL_MS (optional)
  */
 const express = require("express");
 const app = express();
 app.use(express.json());
 
-const INTERVAL_MS = Number(process.env.INTERVAL_MS || 30000);
+const INTERVAL_MS = Number(process.env.INTERVAL_MS || 20000);
 let UPSTOX_TOKEN = String(process.env.UPSTOX_ACCESS_TOKEN || process.env.UPSTOX_API_KEY || "").trim();
 const TG_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const TG_CHAT = String(process.env.TELEGRAM_CHAT_ID || "").trim();
 const FB_PROJECT = String(process.env.FIREBASE_PROJECT_ID || process.env.FB_PROJECT || "").trim();
 const FB_KEY = String(process.env.FIREBASE_API_KEY || process.env.FB_API_KEY || "").trim();
 
-const LAST_SENT = new Map();
+const MEM = new Map();
 let symbolKeyCache = null;
 
 const INDEX_UPSTOX = {
@@ -41,8 +41,7 @@ async function loadSymbolKeyMap() {
     const res = await fetch(url);
     if (res.ok) {
       const buf = Buffer.from(await res.arrayBuffer());
-      const zlib = require("zlib");
-      const text = zlib.gunzipSync(buf).toString("utf8");
+      const text = require("zlib").gunzipSync(buf).toString("utf8");
       const parsed = JSON.parse(text);
       const list = Array.isArray(parsed) ? parsed : (parsed.data || []);
       for (const x of list) {
@@ -50,10 +49,10 @@ async function loadSymbolKeyMap() {
         const ik = String(x.instrument_key || "").trim();
         if (sym && ik && !map.has(sym)) map.set(sym, ik);
       }
-      console.log("[Upstox] Symbol master loaded:", map.size);
+      console.log("[Upstox] master:", map.size);
     }
   } catch (e) {
-    console.warn("[Upstox] master load failed", e.message);
+    console.warn("[Upstox] master fail", e.message);
   }
   symbolKeyCache = map;
   return map;
@@ -62,7 +61,8 @@ async function loadSymbolKeyMap() {
 async function toKey(sym) {
   const s = String(sym || "").toUpperCase().trim();
   if (!s) return "";
-  if (s.includes("|") && /INE[A-Z0-9]+|_INDEX\|/i.test(s)) return s;
+  if (/^(NSE|BSE)_INDEX\|/i.test(s)) return s;
+  if (/^(NSE|BSE)_EQ\|INE/i.test(s)) return s;
   if (INDEX_UPSTOX[s]) return INDEX_UPSTOX[s];
   const map = await loadSymbolKeyMap();
   if (map.has(s)) return map.get(s);
@@ -70,18 +70,22 @@ async function toKey(sym) {
   return "NSE_EQ|" + s;
 }
 
-function indexQuote(quotes, key) {
-  if (!key) return undefined;
-  const k = String(key).toUpperCase();
-  if (Number.isFinite(quotes[k])) return quotes[k];
-  const pipe = k.replace(/:/g, "|");
-  const colon = k.replace(/\|/g, ":");
-  if (Number.isFinite(quotes[pipe])) return quotes[pipe];
-  if (Number.isFinite(quotes[colon])) return quotes[colon];
-  const isin = (pipe.split("|")[1] || colon.split(":")[1] || "").toUpperCase();
-  if (isin && Number.isFinite(quotes[isin])) return quotes[isin];
-  if (isin && Number.isFinite(quotes["NSE_EQ|" + isin])) return quotes["NSE_EQ|" + isin];
-  if (isin && Number.isFinite(quotes["NSE_EQ:" + isin])) return quotes["NSE_EQ:" + isin];
+function pickLtp(quotes, key, sym) {
+  const tryKeys = [];
+  const push = (k) => { if (k) tryKeys.push(String(k).toUpperCase()); };
+  push(key);
+  if (key) {
+    push(key.replace(/:/g, "|"));
+    push(key.replace(/\|/g, ":"));
+    const part = key.split(/[|:]/).pop();
+    push(part);
+    push("NSE_EQ|" + part);
+    push("NSE_EQ:" + part);
+  }
+  push(sym);
+  for (const k of tryKeys) {
+    if (Number.isFinite(quotes[k])) return quotes[k];
+  }
   return undefined;
 }
 
@@ -89,26 +93,24 @@ async function fetchQuotes(keys, token) {
   const out = {};
   const tok = token || UPSTOX_TOKEN;
   if (!tok || !keys.length) {
-    console.warn("[Upstox] No token or no keys for quote fetch");
+    console.warn("[Upstox] skip quotes — token?", !!tok, "keys", keys.length);
     return out;
   }
   for (let i = 0; i < keys.length; i += 50) {
     const chunk = keys.slice(i, i + 50);
-    const q = chunk.map(encodeURIComponent).join(",");
-    const url = "https://api.upstox.com/v2/market-quote/quotes?instrument_key=" + q;
+    const url = "https://api.upstox.com/v2/market-quote/quotes?instrument_key=" +
+      chunk.map(encodeURIComponent).join(",");
     try {
       const res = await fetch(url, {
         headers: { Accept: "application/json", Authorization: "Bearer " + tok }
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        console.warn("[Upstox] quote HTTP", res.status, JSON.stringify(body).slice(0, 200));
-        if (res.status === 401) console.warn("[Upstox] TOKEN INVALID");
+        console.warn("[Upstox] HTTP", res.status, JSON.stringify(body).slice(0, 180));
         continue;
       }
-      const data = body?.data || {};
       let n = 0;
-      for (const [k, row] of Object.entries(data)) {
+      for (const [k, row] of Object.entries(body.data || {})) {
         const last = Number(row?.last_price);
         if (!Number.isFinite(last)) continue;
         n++;
@@ -120,16 +122,15 @@ async function fetchQuotes(keys, token) {
         if (ik) {
           out[ik] = last;
           out[ik.replace(/:/g, "|")] = last;
-          out[ik.replace(/\|/g, ":")] = last;
         }
-        const tsym = String(row.symbol || row.trading_symbol || "").toUpperCase();
+        const tsym = String(row.symbol || "").toUpperCase();
         if (tsym) out[tsym] = last;
         const isin = (ku.split(":")[1] || ku.split("|")[1] || "").toUpperCase();
         if (isin) out[isin] = last;
       }
-      console.log("[Upstox] quote batch ok, instruments:", n);
+      console.log("[Upstox] quotes ok:", n);
     } catch (e) {
-      console.warn("[Upstox] quote fetch error", e.message);
+      console.warn("[Upstox] fetch err", e.message);
     }
   }
   return out;
@@ -137,49 +138,54 @@ async function fetchQuotes(keys, token) {
 
 async function sendTelegram(text) {
   if (!TG_TOKEN || !TG_CHAT) {
-    console.warn("[Telegram] missing bot token or chat id");
-    return;
+    console.warn("[Telegram] missing credentials");
+    return false;
   }
   try {
-    const res = await fetch("https://api.telegram.org/bot" + encodeURIComponent(TG_TOKEN) + "/sendMessage", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: TG_CHAT, text })
-    });
-    if (!res.ok) console.warn("[Telegram] send failed", res.status);
-    else console.log("[Telegram] sent");
+    const res = await fetch(
+      "https://api.telegram.org/bot" + encodeURIComponent(TG_TOKEN) + "/sendMessage",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: TG_CHAT, text })
+      }
+    );
+    if (!res.ok) {
+      console.warn("[Telegram] fail", res.status, await res.text().catch(() => ""));
+      return false;
+    }
+    console.log("[Telegram] ok");
+    return true;
   } catch (e) {
-    console.warn("[Telegram] error", e.message);
+    console.warn("[Telegram] err", e.message);
+    return false;
   }
 }
 
-function hit(prev, last, target, cond) {
-  const c = String(cond || "crossing").toLowerCase();
+function shouldFire(prev, last, target, cond) {
   if (!Number.isFinite(last) || !Number.isFinite(target)) return false;
-  const eps = Math.max(0.05, Math.abs(target) * 0.00005);
-  const near = Math.abs(last - target) <= eps;
+  const eps = Math.max(0.10, Math.abs(target) * 0.0002);
+  if (Math.abs(last - target) <= eps) return true;
 
-  if (c.includes("above") || c === "crossing_up" || c === ">") {
-    if (near) return true;
-    const now = last >= target - eps;
-    if (!Number.isFinite(prev)) return now;
-    return now && !(prev >= target - eps);
+  const c = String(cond || "crossing").toLowerCase().replace(/\s+/g, "_");
+
+  if (c.includes("up") || c === "above" || c === ">") {
+    if (!Number.isFinite(prev)) return last >= target - eps;
+    return prev < target - eps && last >= target - eps;
   }
-  if (c.includes("below") || c === "crossing_down" || c === "<") {
-    if (near) return true;
-    const now = last <= target + eps;
-    if (!Number.isFinite(prev)) return now;
-    return now && !(prev <= target + eps);
+  if (c.includes("down") || c === "below" || c === "<") {
+    if (!Number.isFinite(prev)) return last <= target + eps;
+    return prev > target + eps && last <= target + eps;
   }
-  if (near) return true;
   if (!Number.isFinite(prev)) return false;
-  return (prev < target - eps && last >= target - eps) || (prev > target + eps && last <= target + eps);
+  return (prev < target - eps && last >= target - eps) ||
+         (prev > target + eps && last <= target + eps);
 }
 
-async function loadAlertsDoc() {
+async function loadDoc() {
   if (!FB_PROJECT) {
-    console.warn("[Firestore] Missing FIREBASE_PROJECT_ID");
-    return { alerts: {}, tokenFromDoc: "" };
+    console.warn("[FS] no FIREBASE_PROJECT_ID");
+    return { alerts: {}, token: "" };
   }
   try {
     let url = `https://firestore.googleapis.com/v1/projects/${FB_PROJECT}/databases/(default)/documents/tvup/alerts`;
@@ -187,37 +193,32 @@ async function loadAlertsDoc() {
     const res = await fetch(url);
     const body = await res.json();
     if (!res.ok) {
-      console.warn("[Firestore] HTTP", res.status);
-      return { alerts: {}, tokenFromDoc: "" };
+      console.warn("[FS] HTTP", res.status, JSON.stringify(body).slice(0, 120));
+      return { alerts: {}, token: "" };
     }
-    const fields = body?.fields || {};
-    const raw = fields.alertsJson?.stringValue;
+    const fields = body.fields || {};
     let alerts = {};
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === "object") alerts = parsed;
-      } catch (_) {}
-    }
-    const tokenFromDoc = String(fields.upstoxToken?.stringValue || "").trim();
-    return { alerts, tokenFromDoc };
+    try {
+      const raw = fields.alertsJson?.stringValue;
+      if (raw) {
+        const p = JSON.parse(raw);
+        if (p && typeof p === "object") alerts = p;
+      }
+    } catch (_) {}
+    const token = String(fields.upstoxToken?.stringValue || "").trim();
+    return { alerts, token };
   } catch (e) {
-    console.warn("[Firestore] load failed", e.message);
-    return { alerts: {}, tokenFromDoc: "" };
+    console.warn("[FS] load", e.message);
+    return { alerts: {}, token: "" };
   }
 }
 
-async function markTriggeredInFirestore(alertId) {
-  if (!FB_PROJECT || !alertId) return;
+async function saveAlerts(alerts) {
+  if (!FB_PROJECT) return;
   try {
-    const { alerts } = await loadAlertsDoc();
-    if (!alerts[alertId]) return;
-    alerts[alertId].status = "triggered";
-    alerts[alertId].armed = false;
-    alerts[alertId].lastTriggeredAt = Date.now();
     let url = `https://firestore.googleapis.com/v1/projects/${FB_PROJECT}/databases/(default)/documents/tvup/alerts?updateMask.fieldPaths=alertsJson&updateMask.fieldPaths=updatedAt`;
     if (FB_KEY && FB_KEY !== "direct") url += `&key=${encodeURIComponent(FB_KEY)}`;
-    await fetch(url, {
+    const res = await fetch(url, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -227,72 +228,98 @@ async function markTriggeredInFirestore(alertId) {
         }
       })
     });
-    console.log("[Firestore] marked triggered:", alertId);
+    if (!res.ok) console.warn("[FS] save", res.status, await res.text().catch(() => ""));
+    else console.log("[FS] saved", Object.keys(alerts).length, "alerts");
   } catch (e) {
-    console.warn("[Firestore] mark triggered failed", e.message);
+    console.warn("[FS] save err", e.message);
   }
 }
 
-async function tick() {
-  console.log("---", new Date().toLocaleTimeString(), "Checking Firestore alerts ---");
-  const { alerts, tokenFromDoc } = await loadAlertsDoc();
-  if (tokenFromDoc && tokenFromDoc.length > 20) UPSTOX_TOKEN = tokenFromDoc;
-  if (!UPSTOX_TOKEN) console.warn("[Upstox] No access token");
+function isActive(r) {
+  if (!r || typeof r !== "object") return false;
+  const st = String(r.status || "active").toLowerCase();
+  if (st === "paused" || st === "triggered" || st === "stopped") return false;
+  if (r.armed === false) return false;
+  return true;
+}
 
-  const active = Object.entries(alerts).filter(([, r]) => {
-    if (!r) return false;
-    const st = String(r.status || "active").toLowerCase();
-    if (st === "paused" || st === "triggered" || st === "stopped") return false;
-    if (r.armed === false) return false;
-    return true;
-  });
-  console.log("[Firestore] Total active alert(s):", active.length, active.map(([id]) => id));
+async function tick() {
+  const t0 = Date.now();
+  console.log("---", new Date().toLocaleTimeString(), "tick ---");
+  const { alerts, token } = await loadDoc();
+  if (token && token.length > 20) UPSTOX_TOKEN = token;
+  if (!UPSTOX_TOKEN) console.warn("[Upstox] NO TOKEN");
+
+  const active = Object.entries(alerts).filter(([, r]) => isActive(r));
+  console.log("[FS] active:", active.length, active.map(([id]) => id));
   if (!active.length) return;
 
   const keyMap = {};
   for (const [, r] of active) {
     const sym = String(r.symbol || "").toUpperCase();
+    if (!sym) continue;
     keyMap[sym] = r.instrumentKey || r.instrument_key || (await toKey(sym));
   }
   const keys = [...new Set(Object.values(keyMap).filter(Boolean))];
   const quotes = await fetchQuotes(keys, UPSTOX_TOKEN);
 
+  const toTrigger = [];
   for (const [id, r] of active) {
     const sym = String(r.symbol || "").toUpperCase();
-    const key = String(keyMap[sym] || "");
-    let last = indexQuote(quotes, key);
-    if (!Number.isFinite(last)) last = indexQuote(quotes, sym);
+    const key = keyMap[sym] || "";
+    const last = pickLtp(quotes, key, sym);
     const target = Number(r.price);
-    const prev = LAST_SENT.has(id) ? LAST_SENT.get(id).ltp : NaN;
-    const isHit = hit(prev, last, target, r.condition);
-    console.log("[Check]", sym, "key=", key, "ltp=", last, "target=", target, "hit=", isHit);
+    const mem = MEM.get(id);
+    const prev = mem && Number.isFinite(mem.ltp) ? mem.ltp : NaN;
+    const fire = shouldFire(prev, last, target, r.condition);
+    console.log("[Check]", id.slice(0, 12), sym, "ltp=", last, "tgt=", target, "fire=", fire);
+
     if (Number.isFinite(last)) {
-      const prevSent = LAST_SENT.get(id)?.sent;
-      const prevAt = LAST_SENT.get(id)?.at;
-      LAST_SENT.set(id, { ltp: last, sent: prevSent, at: prevAt });
+      MEM.set(id, { ltp: last, sentAt: mem?.sentAt || 0 });
     }
-    if (!isHit) continue;
-    const already = LAST_SENT.get(id);
-    if (already?.sent && already.at && Date.now() - already.at < 10 * 60 * 1000) continue;
-    if (r.lastTriggeredAt && Date.now() - Number(r.lastTriggeredAt) < 10 * 60 * 1000) continue;
+    if (!fire) continue;
+    if (mem?.sentAt && Date.now() - mem.sentAt < 5 * 60 * 1000) {
+      console.log("[Skip] already sent recently", id);
+      continue;
+    }
+    if (r.lastTriggeredAt && Date.now() - Number(r.lastTriggeredAt) < 5 * 60 * 1000) {
+      console.log("[Skip] FS lastTriggered recent", id);
+      continue;
+    }
+    toTrigger.push({ id, r, sym, last, target });
+  }
+
+  if (!toTrigger.length) {
+    console.log("[Done] no triggers", Date.now() - t0, "ms");
+    return;
+  }
+
+  console.log("[Fire]", toTrigger.length, "alerts");
+  for (const item of toTrigger) {
     const msg =
       "\ud83c\udfaf Price Alert Hit!\n\n" +
-      "\ud83d\udcc8 Symbol: " + sym + "\n" +
-      "\ud83d\udcb0 Price: \u20b9" + last + "\n" +
-      "\ud83c\udfaf Target: \u20b9" + target + "\n" +
-      "\u2699\ufe0f Condition: " + String(r.condition || "crossing").replace(/_/g, " ");
-    await sendTelegram(msg);
-    LAST_SENT.set(id, { ltp: last, sent: true, at: Date.now() });
-    console.log("[TRIGGER]", sym, "[Telegram] sent");
-    await markTriggeredInFirestore(id);
+      "\ud83d\udcc8 Symbol: " + item.sym + "\n" +
+      "\ud83d\udcb0 Price: \u20b9" + item.last + "\n" +
+      "\ud83c\udfaf Target: \u20b9" + item.target + "\n" +
+      "\u2699\ufe0f Condition: " + String(item.r.condition || "crossing").replace(/_/g, " ");
+    const ok = await sendTelegram(msg);
+    MEM.set(item.id, { ltp: item.last, sentAt: Date.now() });
+    item.r.status = "triggered";
+    item.r.armed = false;
+    item.r.lastTriggeredAt = Date.now();
+    alerts[item.id] = item.r;
+    console.log(ok ? "[TRIGGER ok]" : "[TRIGGER tg-fail]", item.sym);
+    await new Promise((r) => setTimeout(r, 400));
   }
+  await saveAlerts(alerts);
+  console.log("[Done] triggers flushed", Date.now() - t0, "ms");
 }
 
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "TVUP Alert Worker (Upstox)",
-    version: "3.0.8",
+    version: "3.0.9",
     intervalMs: INTERVAL_MS,
     hasToken: Boolean(UPSTOX_TOKEN),
     hasTelegram: Boolean(TG_TOKEN && TG_CHAT),
@@ -300,9 +327,18 @@ app.get("/", (_req, res) => {
   });
 });
 
+app.get("/tick", async (_req, res) => {
+  try {
+    await tick();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 app.listen(process.env.PORT || 3000, () => {
-  console.log("TVUP Alert Worker (Upstox) v3.0.8 is running!");
+  console.log("TVUP Alert Worker (Upstox) v3.0.9 running, interval", INTERVAL_MS);
   loadSymbolKeyMap().catch(() => {});
   setInterval(() => tick().catch((e) => console.warn(e)), INTERVAL_MS);
-  tick().catch(() => {});
+  setTimeout(() => tick().catch(() => {}), 2000);
 });
