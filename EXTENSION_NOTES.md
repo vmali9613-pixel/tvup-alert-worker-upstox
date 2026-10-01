@@ -1,13 +1,16 @@
-# Chrome extension (not deployed on Render)
+# Chrome extension notes
 
-Render only runs `index.js` (cloud alerts).
+## v3.0.5
+- Sector indices (CNXIT, CNXAUTO, CNXMIDCAP, …) mapped to Upstox `NSE_INDEX|Nifty …` keys
+- TradingView chart: try `tv_symbol` (CNX*) then trading symbol
+- Default Firestore project: `tvup-watchlist-for-upstox`
+- CHG uses Upstox `net_change` (v3.0.4)
 
-Watchlist LTP / CHG / CHG% runs inside the **Chrome extension**.
+## Alerts checklist
+1. Extension Settings: Upstox access token
+2. Firestore project ID must match Render `FIREBASE_PROJECT_ID` = `tvup-watchlist-for-upstox`
+3. Document `tvup/alerts` field `alertsJson` = `{}` (string) until extension writes alerts
+4. Render env: UPSTOX_ACCESS_TOKEN, TELEGRAM_*, FIREBASE_*
+5. After saving an alert in extension, Render logs should show active count > 0 within ~1 min
 
-## v3.0.4 fix
-Upstox full quote uses `net_change` (day change vs previous close).
-Older parse only looked for Fyers-style `ch` / `change`, so LAST filled but CHG/CHG% stayed blank — including after market close.
-
-Install the latest extension ZIP on PC (Load unpacked). No Render redeploy needed for this UI fix.
-
-Firestore `tvup/alerts` field `alertsJson` must be string `{}` (not `0`).
+Render only runs cloud worker. Install extension ZIP on Chrome for watchlist LTP/CHG/charts.
