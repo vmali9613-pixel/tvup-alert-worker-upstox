@@ -1,5 +1,5 @@
 /**
- * TVUP Alert Worker — Upstox edition v3.0.7
+ * TVUP Alert Worker — Upstox edition v3.0.8
  * Env: UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
  *      FIREBASE_PROJECT_ID, FIREBASE_API_KEY
  */
@@ -7,7 +7,7 @@ const express = require("express");
 const app = express();
 app.use(express.json());
 
-const INTERVAL_MS = Number(process.env.INTERVAL_MS || 60000);
+const INTERVAL_MS = Number(process.env.INTERVAL_MS || 30000);
 let UPSTOX_TOKEN = String(process.env.UPSTOX_ACCESS_TOKEN || process.env.UPSTOX_API_KEY || "").trim();
 const TG_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const TG_CHAT = String(process.env.TELEGRAM_CHAT_ID || "").trim();
@@ -103,7 +103,7 @@ async function fetchQuotes(keys, token) {
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
         console.warn("[Upstox] quote HTTP", res.status, JSON.stringify(body).slice(0, 200));
-        if (res.status === 401) console.warn("[Upstox] TOKEN INVALID — set UPSTOX_ACCESS_TOKEN on Render");
+        if (res.status === 401) console.warn("[Upstox] TOKEN INVALID");
         continue;
       }
       const data = body?.data || {};
@@ -137,7 +137,7 @@ async function fetchQuotes(keys, token) {
 
 async function sendTelegram(text) {
   if (!TG_TOKEN || !TG_CHAT) {
-    console.warn("[Telegram] missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID");
+    console.warn("[Telegram] missing bot token or chat id");
     return;
   }
   try {
@@ -146,29 +146,30 @@ async function sendTelegram(text) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: TG_CHAT, text })
     });
-    if (!res.ok) console.warn("[Telegram] send failed", res.status, await res.text().catch(() => ""));
+    if (!res.ok) console.warn("[Telegram] send failed", res.status);
     else console.log("[Telegram] sent");
   } catch (e) {
     console.warn("[Telegram] error", e.message);
   }
 }
 
-/** Float-safe alert hit. Crossing treats near-equal LTP as hit (tick noise). */
 function hit(prev, last, target, cond) {
   const c = String(cond || "crossing").toLowerCase();
   if (!Number.isFinite(last) || !Number.isFinite(target)) return false;
   const eps = Math.max(0.05, Math.abs(target) * 0.00005);
   const near = Math.abs(last - target) <= eps;
 
-  if (c.includes("above") || c === ">") {
+  if (c.includes("above") || c === "crossing_up" || c === ">") {
+    if (near) return true;
     const now = last >= target - eps;
-    const was = Number.isFinite(prev) && prev >= target - eps;
-    return now && !was;
+    if (!Number.isFinite(prev)) return now;
+    return now && !(prev >= target - eps);
   }
-  if (c.includes("below") || c === "<") {
+  if (c.includes("below") || c === "crossing_down" || c === "<") {
+    if (near) return true;
     const now = last <= target + eps;
-    const was = Number.isFinite(prev) && prev <= target + eps;
-    return now && !was;
+    if (!Number.isFinite(prev)) return now;
+    return now && !(prev <= target + eps);
   }
   if (near) return true;
   if (!Number.isFinite(prev)) return false;
@@ -186,7 +187,7 @@ async function loadAlertsDoc() {
     const res = await fetch(url);
     const body = await res.json();
     if (!res.ok) {
-      console.warn("[Firestore] HTTP", res.status, JSON.stringify(body).slice(0, 150));
+      console.warn("[Firestore] HTTP", res.status);
       return { alerts: {}, tokenFromDoc: "" };
     }
     const fields = body?.fields || {};
@@ -235,12 +236,8 @@ async function markTriggeredInFirestore(alertId) {
 async function tick() {
   console.log("---", new Date().toLocaleTimeString(), "Checking Firestore alerts ---");
   const { alerts, tokenFromDoc } = await loadAlertsDoc();
-  if (tokenFromDoc && tokenFromDoc.length > 20) {
-    UPSTOX_TOKEN = tokenFromDoc;
-  }
-  if (!UPSTOX_TOKEN) {
-    console.warn("[Upstox] No access token (env UPSTOX_ACCESS_TOKEN or Firestore upstoxToken)");
-  }
+  if (tokenFromDoc && tokenFromDoc.length > 20) UPSTOX_TOKEN = tokenFromDoc;
+  if (!UPSTOX_TOKEN) console.warn("[Upstox] No access token");
 
   const active = Object.entries(alerts).filter(([, r]) => {
     if (!r) return false;
@@ -271,10 +268,13 @@ async function tick() {
     console.log("[Check]", sym, "key=", key, "ltp=", last, "target=", target, "hit=", isHit);
     if (Number.isFinite(last)) {
       const prevSent = LAST_SENT.get(id)?.sent;
-      LAST_SENT.set(id, { ltp: last, sent: prevSent });
+      const prevAt = LAST_SENT.get(id)?.at;
+      LAST_SENT.set(id, { ltp: last, sent: prevSent, at: prevAt });
     }
     if (!isHit) continue;
-    if (LAST_SENT.get(id)?.sent) continue;
+    const already = LAST_SENT.get(id);
+    if (already?.sent && already.at && Date.now() - already.at < 10 * 60 * 1000) continue;
+    if (r.lastTriggeredAt && Date.now() - Number(r.lastTriggeredAt) < 10 * 60 * 1000) continue;
     const msg =
       "\ud83c\udfaf Price Alert Hit!\n\n" +
       "\ud83d\udcc8 Symbol: " + sym + "\n" +
@@ -282,7 +282,7 @@ async function tick() {
       "\ud83c\udfaf Target: \u20b9" + target + "\n" +
       "\u2699\ufe0f Condition: " + String(r.condition || "crossing").replace(/_/g, " ");
     await sendTelegram(msg);
-    LAST_SENT.set(id, { ltp: last, sent: true });
+    LAST_SENT.set(id, { ltp: last, sent: true, at: Date.now() });
     console.log("[TRIGGER]", sym, "[Telegram] sent");
     await markTriggeredInFirestore(id);
   }
@@ -292,7 +292,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "TVUP Alert Worker (Upstox)",
-    version: "3.0.7",
+    version: "3.0.8",
     intervalMs: INTERVAL_MS,
     hasToken: Boolean(UPSTOX_TOKEN),
     hasTelegram: Boolean(TG_TOKEN && TG_CHAT),
@@ -301,7 +301,7 @@ app.get("/", (_req, res) => {
 });
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log("TVUP Alert Worker (Upstox) v3.0.7 is running!");
+  console.log("TVUP Alert Worker (Upstox) v3.0.8 is running!");
   loadSymbolKeyMap().catch(() => {});
   setInterval(() => tick().catch((e) => console.warn(e)), INTERVAL_MS);
   tick().catch(() => {});
