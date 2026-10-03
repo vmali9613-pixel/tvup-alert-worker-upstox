@@ -430,7 +430,7 @@ async function tickInner() {
   const doc = await loadDoc();
   health.fsOk = doc.ok;
   if (!doc.ok) {
-    console.warn("[Tick] Firestore unavailable — skip");
+    console.warn(`[Tick] ${istNow()} Firestore unavailable — skip`);
     health.fsFails = (health.fsFails || 0) + 1;
     if (health.fsFails >= 10) await notice("fs", "\u26a0\ufe0f TVUP worker: Firestore se alerts nahi mil rahe (project/key/rules check karo). Alerts abhi check nahi ho rahe.");
     return { ok: false };
@@ -445,7 +445,11 @@ async function tickInner() {
 
   const active = Object.entries(alerts).filter(([id, r]) => isActive(r) && !PENDING.has(id));
   health.active = active.length;
-  if (!active.length) { health.lastOkTick = Date.now(); return { ok: true, active: 0 }; }
+  if (!active.length) {
+    console.log(`[Tick] ${istNow()} active=0 (koi active alert nahi) ${Date.now() - t0}ms`);
+    health.lastOkTick = Date.now();
+    return { ok: true, active: 0 };
+  }
 
   const keyOf = {};
   const unresolved = [];
@@ -494,7 +498,7 @@ async function tickInner() {
     toFire.push({ id, r, sym, last, target, sig });
   }
   health.quotes = got;
-  console.log(`[Tick] active=${active.length} keys=${keys.length} prices=${got} fire=${toFire.length} ${Date.now() - t0}ms`);
+  console.log(`[Tick] ${istNow()} active=${active.length} keys=${keys.length} prices=${got} fire=${toFire.length} ${Date.now() - t0}ms`);
 
   for (const it of toFire) {
     const msg =
