@@ -1,6 +1,53 @@
-/** TEMP STUB - REUPLOAD YOUR index.js FROM LOCAL BACKUP */
-const express = require("express");
-const app = express();
-app.get("/", (_req, res) => res.json({ ok: false, error: "Re-upload index.js from your local backup (v3.2.0). Accidental PLACEHOLDER commit needs restore." }));
-app.get("/health", (_req, res) => res.send("need-restore"));
-app.listen(process.env.PORT || 3000, () => console.log("STUB - reupload index.js"));
+/**
+ * Bootstrap loader: fetches last good worker (commit 50f6f7c), removes Telegram date/time, runs as v3.2.1
+ * After Render deploys, optional: replace this file with the full expanded index.js from your PC backup.
+ */
+const https = require("https");
+const fs = require("fs");
+
+const SRC_URL =
+  "https://raw.githubusercontent.com/vmali9613-pixel/tvup-alert-worker-upstox/50f6f7c35f6d67ac664bf6dedc9c890b94d6fcaa/index.js";
+
+function get(url) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          return get(res.headers.location).then(resolve, reject);
+        }
+        if (res.statusCode !== 200) {
+          reject(new Error("HTTP " + res.statusCode + " fetching worker source"));
+          return;
+        }
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => resolve(data));
+      })
+      .on("error", reject);
+  });
+}
+
+(async () => {
+  try {
+    let src = await get(SRC_URL);
+    // Remove: "🕒 " + istNow()  (unicode escape form in source)
+    src = src.replace(/\s*"\\ud83d\\udd52 " \+ istNow\(\);/, "");
+    // If Condition line still ends with + "\n" +, turn into ;
+    src = src.replace(/(\.replace\(\/_\/g, " "\)) \+ "\\n" \+/, "$1;");
+    src = src.replace(/const VERSION = "3\.2\.0"/, 'const VERSION = "3.2.1"');
+    src = src.replace(/Upstox v3\.2\.0/, "Upstox v3.2.1");
+    const out = "/tmp/tvup_worker_fixed.js";
+    fs.writeFileSync(out, src);
+    console.log("[Bootstrap] fixed worker ready", src.length, "bytes — starting");
+    require(out);
+  } catch (e) {
+    console.error("[Bootstrap] failed", e);
+    const express = require("express");
+    const app = express();
+    app.get("/", (_req, res) =>
+      res.json({ ok: false, error: String(e.message || e), tip: "Re-upload full index.js to GitHub" })
+    );
+    app.get("/health", (_req, res) => res.send("bootstrap-fail"));
+    app.listen(process.env.PORT || 3000);
+  }
+})();
