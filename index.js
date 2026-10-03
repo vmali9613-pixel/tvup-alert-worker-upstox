@@ -1,6 +1,6 @@
 /**
- * Bootstrap: load last good worker into project dir (so express resolves),
- * strip Telegram date/time, run as v3.2.1
+ * Bootstrap: load last good worker into project dir (express works),
+ * strip ALL Telegram date/time lines, run as v3.2.1
  */
 const https = require("https");
 const fs = require("fs");
@@ -32,9 +32,20 @@ function get(url) {
   try {
     let src = await get(SRC_URL);
 
-    // Remove Telegram date/time line: clock emoji + istNow()
+    // 1) Main alert: remove "🕒 " + istNow();
     src = src.replace(/\s*"\\ud83d\\udd52 " \+ istNow\(\);/, "");
-    src = src.replace(/(\.replace\(\/_\/g, " "\)) \+ "\\n" \+/, "$1;");
+    // 2) Late-delivery alert: remove "🕒 " + new Date(lt).toLocaleString(...)
+    src = src.replace(
+      /\s*"\\ud83d\\udd52 " \+ new Date\(lt\)\.toLocaleString\([^)]*\)/,
+      ""
+    );
+    // Fix trailing + "\n" + left on Condition lines
+    src = src.replace(/(\.replace\(\/_\/g, " "\)) \+ "\\n" \+/g, "$1;");
+    // If Condition ends with + "\n"  (no following +) after late strip
+    src = src.replace(
+      /(\.replace\(\/_\/g, " "\)) \+ "\\n"\s*;/g,
+      "$1;"
+    );
 
     src = src.replace(/const VERSION = "3\.2\.0"/, 'const VERSION = "3.2.1"');
     src = src.replace(/Upstox v3\.2\.0/, "Upstox v3.2.1");
@@ -45,10 +56,10 @@ function get(url) {
       "start();"
     );
 
-    // MUST write inside project dir so node_modules/express resolves
+    // Write INSIDE project dir so node_modules/express resolves
     const out = path.join(__dirname, "_worker_runtime.js");
     fs.writeFileSync(out, src);
-    console.log("[Bootstrap] fixed worker ready", src.length, "bytes — starting from", out);
+    console.log("[Bootstrap] fixed worker ready", src.length, "bytes —", out);
     require(out);
   } catch (e) {
     console.error("[Bootstrap] failed", e);
