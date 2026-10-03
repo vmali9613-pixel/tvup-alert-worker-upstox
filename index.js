@@ -1,6 +1,5 @@
 /**
- * Bootstrap loader: fetches last good worker (commit 50f6f7c), removes Telegram date/time, runs as v3.2.1
- * After Render deploys, optional: replace this file with the full expanded index.js from your PC backup.
+ * Bootstrap: load last good worker, strip Telegram date/time, run as v3.2.1
  */
 const https = require("https");
 const fs = require("fs");
@@ -30,12 +29,21 @@ function get(url) {
 (async () => {
   try {
     let src = await get(SRC_URL);
-    // Remove: "🕒 " + istNow()  (unicode escape form in source)
+
+    // Remove Telegram date/time line: "🕒 " + istNow();
     src = src.replace(/\s*"\\ud83d\\udd52 " \+ istNow\(\);/, "");
-    // If Condition line still ends with + "\n" +, turn into ;
+    // Condition line: ...replace(...) + "\n" +  →  ...replace(...);
     src = src.replace(/(\.replace\(\/_\/g, " "\)) \+ "\\n" \+/, "$1;");
+
     src = src.replace(/const VERSION = "3\.2\.0"/, 'const VERSION = "3.2.1"');
     src = src.replace(/Upstox v3\.2\.0/, "Upstox v3.2.1");
+
+    // When required by bootstrap, still start the server
+    src = src.replace(
+      /if\s*\(\s*require\.main\s*===\s*module\s*\)\s*start\s*\(\s*\)\s*;/,
+      "start();"
+    );
+
     const out = "/tmp/tvup_worker_fixed.js";
     fs.writeFileSync(out, src);
     console.log("[Bootstrap] fixed worker ready", src.length, "bytes — starting");
