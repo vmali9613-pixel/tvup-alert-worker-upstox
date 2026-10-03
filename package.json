@@ -1,8 +1,9 @@
 {
   "name": "tvup-alert-worker-upstox",
-  "version": "3.0.1",
+  "version": "3.1.0",
   "private": true,
   "main": "index.js",
+  "engines": { "node": ">=18" },
   "scripts": { "start": "node index.js" },
   "dependencies": { "express": "^4.19.2" }
 }
